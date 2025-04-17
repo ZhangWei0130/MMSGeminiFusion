@@ -3,7 +3,7 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from semseg.models.layers import DropPath
 import torch.nn.init as init
-from semseg.models.backbones.geminifusion_backbone import *
+from semseg.models.backbones.half_att import *
 
 
 class ChannelAttentionBlock(nn.Module):
@@ -344,7 +344,7 @@ class MixTransformer(nn.Module):
         return outs
 
 
-class MMSGemini(nn.Module):
+class HALF(nn.Module):
     def __init__(self, model_name: str = 'B0', modals: list = ['rgb', 'depth', 'event', 'lidar']):
         super().__init__()
         assert model_name in mit_settings.keys(), f"Model name should be in {list(cmnext_settings.keys())}"

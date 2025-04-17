@@ -431,7 +431,7 @@ class PredictorConv(nn.Module):
         return x_
 
 
-class GeminiFusionBackbone(nn.Module):
+class HALF_ATT(nn.Module):
     def __init__(
         self,
         model_name="B0",

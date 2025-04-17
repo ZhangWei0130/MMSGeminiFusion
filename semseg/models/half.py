@@ -8,10 +8,10 @@ from semseg.models.base import BaseModel
 from semseg.models.heads import SegFormerHead
 from semseg.models.layers import trunc_normal_
 
-class MMSGeminiFusion(nn.Module):
+class HALFusion(nn.Module):
     def __init__(
         self,
-        backbone: str = "MMSGemini-B0",
+        backbone: str = "HALF-B0",
         num_classes: int = 25,
         modals: list = ["img", "depth", "event", "lidar"],
         drop_path_rate: float = 0.0,
@@ -19,54 +19,55 @@ class MMSGeminiFusion(nn.Module):
         super().__init__()
 
         backbone, variant = backbone.split("-")
-        self.backbone_mms = eval(backbone)(
+        self.backbone_half = eval(backbone)(
             variant,
             modals
         )
         self.modals = modals
 
-        backbone = "GeminiFusionBackbone"
-        self.backbone_gemini = eval(backbone)(
+        backbone = "HALF_ATT"
+        self.backbone_half_att = eval(backbone)(
             variant,
             modals,
             drop_path_rate=drop_path_rate,
             num_modal=len(modals),
         )
 
-        self.decode_head_mms = SegFormerHead(
-            self.backbone_mms.channels, 
+        self.decode_head_half = SegFormerHead(
+            self.backbone_half.channels, 
             256 if 'B0' in backbone or 'B1' in backbone else 512, 
             num_classes
         )
 
-        self.decode_head_gemini = SegFormerHead(
-            self.backbone_gemini.embed_dims,
+        self.decode_head_half_att = SegFormerHead(
+            self.backbone_half_att.embed_dims,
             256 if "B0" in backbone or "B1" in backbone else 512,
             num_classes,
         )
         self.apply(self._init_weights)
 
-        self.num_Gemini = 2
-        self.num_parallel = 3
+        self.num_parallel = 2
         self.alpha = torch.nn.Parameter(
             torch.ones(self.num_parallel, requires_grad=True)
         )
         self.register_parameter("alpha", self.alpha)
 
     def forward(self, x: list) -> list:
-        x_mms = self.backbone_mms(x)
-        x_gemini = self.backbone_gemini(x)
+        x_half = self.backbone_half(x)
+        x_half_att = self.backbone_half_att(x)
         outs = []
-        out = self.decode_head_mms(x_mms)
-        out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
-        outs.append(out)
 
-        for idx in range(self.num_Gemini):
-            out = self.decode_head_gemini(x_gemini[idx])
+        for idx in range(self.num_parallel):
+            out = self.decode_head_half_att(x_half_att[idx])
             out = F.interpolate(
                 out, size=x[0].shape[2:], mode='bilinear', align_corners=False
             )
             outs.append(out)
+
+        out = self.decode_head_half(x_half)
+        out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
+        outs.append(out)
+
         ens = 0
         alpha_soft = F.softmax(self.alpha, dim=0)
         for idx in range(self.num_parallel):
@@ -98,15 +99,15 @@ class MMSGeminiFusion(nn.Module):
                 checkpoint = checkpoint["model"]
             checkpoint.pop("head.weight")
             checkpoint.pop("head.bias")
-            checkpoint_mms = self._expand_state_dict(
-                self.backbone_mms.state_dict(), checkpoint, self.num_parallel
+            checkpoint_half = self._expand_state_dict(
+                self.backbone_half.state_dict(), checkpoint, self.num_parallel
             )
-            checkpoint_gemini = self._expand_state_dict(
-                self.backbone_gemini.state_dict(), checkpoint, self.num_parallel
+            checkpoint_half_att = self._expand_state_dict(
+                self.backbone_half_att.state_dict(), checkpoint, self.num_parallel
             )
-            msg = self.backbone_mms.load_state_dict(checkpoint_mms, strict=True)
+            msg = self.backbone_half.load_state_dict(checkpoint_half, strict=True)
             print(msg)
-            msg = self.backbone_gemini.load_state_dict(checkpoint_gemini, strict=True)
+            msg = self.backbone_half_att.load_state_dict(checkpoint_half_att, strict=True)
             print(msg)
 
 
@@ -129,7 +130,7 @@ class MMSGeminiFusion(nn.Module):
 if __name__ == "__main__":
     modals = ["img"]
     # modals = ['img', 'depth', 'event', 'lidar']
-    model = MMSGemini("MMSGemini-B2", 25, modals)
+    model = HALF("HALF-B2", 25, modals)
     model.init_pretrained("checkpoints/pretrained/segformer/mit_b2.pth")
     x = [torch.zeros(1, 3, 512, 512)]
     y = model(x)

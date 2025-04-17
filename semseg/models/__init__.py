@@ -1,5 +1,5 @@
-from .mmsgemini import MMSGeminiFusion
+from .half import HALFusion
 
 __all__ = [
-    'MMSGeminiFusion',
+    'HALFusion',
 ]
