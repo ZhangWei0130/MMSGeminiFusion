@@ -53,8 +53,8 @@ class HALFusion(nn.Module):
         self.register_parameter("alpha", self.alpha)
 
     def forward(self, x: list) -> list:
-        x_half = self.backbone_half(x)
         x_half_att = self.backbone_half_att(x)
+        x_half = self.backbone_half(x)
         outs = []
 
         for idx in range(self.num_parallel):
@@ -72,6 +72,7 @@ class HALFusion(nn.Module):
         alpha_soft = F.softmax(self.alpha, dim=0)
         for idx in range(self.num_parallel):
             ens += alpha_soft[idx] * outs[idx].detach()
+        outs = []
         outs.append(ens)
         return outs
 

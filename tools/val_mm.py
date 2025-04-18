@@ -91,7 +91,7 @@ def evaluate(cfg, model, dataloader, device):
         else:
             preds = model(images)
             # preds = model(images).softmax(dim=1)
-        if cfg["MODEL"]["NAME"] == "GeminiFusion":
+        if cfg["MODEL"]["NAME"] == "HALFusion":
             metrics.update(preds[-1], labels)
         else:
             metrics.update(preds, labels)
