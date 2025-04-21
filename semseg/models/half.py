@@ -3,136 +3,161 @@ import torch.nn as nn
 import math
 from torch import Tensor
 from torch.nn import functional as F
+from torch.cuda.amp import autocast
+from torch.utils.checkpoint import checkpoint
 from semseg.models.backbones import *
 from semseg.models.base import BaseModel
 from semseg.models.heads import SegFormerHead
 from semseg.models.layers import trunc_normal_
 
-class HALFusion(nn.Module):
+class HALFusionOptimized(nn.Module):
     def __init__(
         self,
-        backbone: str = "HALF-B0",
+        backbone_cfg: str = "HALF-B0",
         num_classes: int = 25,
         modals: list = ["img", "depth", "event", "lidar"],
         drop_path_rate: float = 0.0,
+        use_checkpoint: bool = True,
+        use_amp: bool = True
     ) -> None:
         super().__init__()
-
-        backbone, variant = backbone.split("-")
-        self.backbone_half = eval(backbone)(
-            variant,
-            modals
-        )
         self.modals = modals
+        self.use_checkpoint = use_checkpoint
+        self.use_amp = use_amp
 
-        backbone = "HALF_ATT"
-        self.backbone_half_att = eval(backbone)(
-            variant,
-            modals,
-            drop_path_rate=drop_path_rate,
-            num_modal=len(modals),
-        )
+        # 统一Backbone初始化
+        self.backbones = nn.ModuleDict({
+            'half': self._build_backbone(backbone_cfg, modals, drop_path_rate),
+            'half_att': self._build_backbone("HALF_ATT-B0", modals, drop_path_rate)
+        })
 
-        self.decode_head_half = SegFormerHead(
-            self.backbone_half.channels, 
-            256 if 'B0' in backbone or 'B1' in backbone else 512, 
-            num_classes
-        )
-
-        self.decode_head_half_att = SegFormerHead(
-            self.backbone_half_att.embed_dims,
-            256 if "B0" in backbone or "B1" in backbone else 512,
-            num_classes,
-        )
-        self.apply(self._init_weights)
-
-        self.num_parallel = 2
-        self.alpha = torch.nn.Parameter(
-            torch.ones(self.num_parallel, requires_grad=True)
-        )
-        self.register_parameter("alpha", self.alpha)
-
-    def forward(self, x: list) -> list:
-        x_half_att = self.backbone_half_att(x)
-        x_half = self.backbone_half(x)
-        outs = []
-
-        for idx in range(self.num_parallel):
-            out = self.decode_head_half_att(x_half_att[idx])
-            out = F.interpolate(
-                out, size=x[0].shape[2:], mode='bilinear', align_corners=False
+        # 动态解码头生成
+        self.heads = nn.ModuleDict()
+        for name, backbone in self.backbones.items():
+            head_dim = 512 if 'B2' in backbone_cfg else 256
+            self.heads[name] = SegFormerHead(
+                backbone.embed_dims,
+                head_dim,
+                num_classes
             )
-            outs.append(out)
 
-        out = self.decode_head_half(x_half)
-        out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
-        outs.append(out)
+        # 可学习参数优化
+        self.alpha = nn.Parameter(torch.ones(2))
+        self._init_weights()
 
-        ens = 0
-        alpha_soft = F.softmax(self.alpha, dim=0)
-        for idx in range(self.num_parallel):
-            ens += alpha_soft[idx] * outs[idx].detach()
+    def _build_backbone(self, cfg: str, modals: list, drop_path: float):
+        """统一Backbone构造方法"""
+        name, variant = cfg.split('-')
+        return eval(name)(
+            variant=variant,
+            modals=modals,
+            drop_path_rate=drop_path,
+            num_modal=len(modals)
+        )
+
+    @autocast(enabled=True)
+    def forward(self, x: list) -> list:
+        # 并行特征提取
+        features = {}
+        for name in ['half_att', 'half']:
+            backbone = self.backbones[name]
+            if self.use_checkpoint and self.training:
+                features[name] = checkpoint(backbone, x)
+            else:
+                features[name] = backbone(x)
+
+        # 多分支处理
         outs = []
-        outs.append(ens)
-        return outs
+        # 处理half_att的两个分支
+        for idx in range(2):
+            out = self._process_branch(features['half_att'][idx], 'half_att')
+            outs.append(out)
+        
+        # 处理half分支
+        out_half = self._process_branch(features['half'], 'half')
+        outs.append(out_half)
 
-    def _init_weights(self, m: nn.Module) -> None:
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.Conv2d):
-            fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-            fan_out // m.groups
-            m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, (nn.LayerNorm, nn.BatchNorm2d)):
-            nn.init.ones_(m.weight)
-            nn.init.zeros_(m.bias)
+        # 动态融合（保留完整梯度流）
+        alpha = F.softmax(self.alpha, dim=0)
+        fused = sum(alpha[i] * outs[i] for i in range(2))  # 移除了detach()
+        outs.append(fused)
+        
+        return [outs[-1]] if not self.training else outs
 
-    def init_pretrained(self, pretrained: str = None) -> None:
+    def _process_branch(self, features, head_name):
+        """统一分支处理逻辑"""
+        out = self.heads[head_name](features)
+        return F.interpolate(
+            out, 
+            size=features.shape[2:] if self.training else self.input_shape,
+            mode='bilinear', 
+            align_corners=False
+        )
+
+    def _init_weights(self):
+        """优化的参数初始化"""
+        for name, m in self.named_modules():
+            if isinstance(m, nn.Linear):
+                trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Conv2d):
+                fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                fan_out //= m.groups
+                nn.init.normal_(m.weight, 0, math.sqrt(2.0 / fan_out))
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.LayerNorm, nn.BatchNorm2d)):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0)
+        nn.init.ones_(self.alpha)  # 初始化融合权重
+
+    def init_pretrained(self, pretrained: str = None):
+        """改进的预训练权重加载"""
         if pretrained:
             checkpoint = torch.load(pretrained, map_location="cpu")
-            if "state_dict" in checkpoint.keys():
-                checkpoint = checkpoint["state_dict"]
-            if "model" in checkpoint.keys():
-                checkpoint = checkpoint["model"]
-            checkpoint.pop("head.weight")
-            checkpoint.pop("head.bias")
-            checkpoint_half = self._expand_state_dict(
-                self.backbone_half.state_dict(), checkpoint, self.num_parallel
-            )
-            checkpoint_half_att = self._expand_state_dict(
-                self.backbone_half_att.state_dict(), checkpoint, self.num_parallel
-            )
-            msg = self.backbone_half.load_state_dict(checkpoint_half, strict=True)
-            print(msg)
-            msg = self.backbone_half_att.load_state_dict(checkpoint_half_att, strict=True)
-            print(msg)
+            state_dict = checkpoint.get('model', checkpoint)
+            
+            # 自动适配不同权重格式
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('backbone.'):
+                    new_state_dict[k[9:]] = v  # 去除backbone.前缀
+                else:
+                    new_state_dict[k] = v
+            
+            # 并行加载机制
+            load_results = {}
+            for name in ['half', 'half_att']:
+                filtered = {k: v for k, v in new_state_dict.items() 
+                          if k.startswith(self.backbones[name].prefix)}
+                load_results[name] = self.backbones[name].load_state_dict(
+                    self._adapt_weights(filtered, name), 
+                    strict=False
+                )
+            print(f"Backbone half load: {load_results['half']}")
+            print(f"Backbone half_att load: {load_results['half_att']}")
 
-
-    def _expand_state_dict(self, model_dict, state_dict, num_parallel):
-        model_dict_keys = model_dict.keys()
-        state_dict_keys = state_dict.keys()
-        for model_dict_key in model_dict_keys:
-            model_dict_key_re = model_dict_key.replace("module.", "")
-            if model_dict_key_re in state_dict_keys:
-                model_dict[model_dict_key] = state_dict[model_dict_key_re]
-            for i in range(num_parallel):
-                ln = ".ln_%d" % i
-                replace = True if ln in model_dict_key_re else False
-                model_dict_key_re = model_dict_key_re.replace(ln, "")
-                if replace and model_dict_key_re in state_dict_keys:
-                    model_dict[model_dict_key] = state_dict[model_dict_key_re]
-        return model_dict
-
+    def _adapt_weights(self, state_dict, branch_name):
+        """权重适配转换"""
+        converted = {}
+        prefix_len = len(self.backbones[branch_name].prefix)
+        for k, v in state_dict.items():
+            new_key = k[prefix_len:]  # 去除分支特定前缀
+            converted[new_key] = v
+        return converted
 
 if __name__ == "__main__":
-    modals = ["img"]
-    # modals = ['img', 'depth', 'event', 'lidar']
-    model = HALF("HALF-B2", 25, modals)
+    # 测试用例
+    model = HALFusionOptimized(
+        backbone_cfg="HALF-B2",
+        num_classes=25,
+        modals=["img"],
+        use_checkpoint=True
+    )
     model.init_pretrained("checkpoints/pretrained/segformer/mit_b2.pth")
-    x = [torch.zeros(1, 3, 512, 512)]
-    y = model(x)
-    print(y.shape)
+    
+    with torch.no_grad():
+        x = [torch.randn(2, 3, 512, 512)]
+        outputs = model(x)
+        print(f"Output shapes: {[o.shape for o in outputs]}")
